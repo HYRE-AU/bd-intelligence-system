@@ -1,0 +1,35 @@
+{
+  "name": "bd-intelligence-system",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Perfectly BD intelligence system — monitors YC ecosystem for sales hiring signals",
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test:p1": "ts-node scripts/test-pipeline-1.ts",
+    "test:p2": "ts-node scripts/test-pipeline-2.ts",
+    "test:p3": "ts-node scripts/test-pipeline-3.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HYRE-AU/bd-intelligence-system.git"
+  },
+  "author": "Perfectly",
+  "license": "ISC",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "dotenv": "^17.3.1",
+    "fuse.js": "^7.0.0",
+    "openai": "^4.85.4",
+    "playwright": "^1.50.1",
+    "resend": "^4.1.2",
+    "rss-parser": "^3.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "@vercel/node": "^5.1.8",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}
