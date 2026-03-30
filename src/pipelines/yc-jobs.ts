@@ -1,4 +1,3 @@
-import { chromium, type Page } from 'playwright';
 import { SALES_KEYWORDS } from '../config/keywords';
 import {
   jobIdExists,
@@ -8,13 +7,11 @@ import {
 import type { YCJobListing } from '../types';
 
 // ── URLs to scrape ──
-// Scraped in order. Jobs on each page are rendered newest-first.
 
-const YC_JOBS_URLS = [
-  'https://www.ycombinator.com/jobs',
-  'https://www.ycombinator.com/jobs/role/sales-manager/san-francisco',
-  'https://www.ycombinator.com/jobs/role/all',
-];
+const YC_JOBS_URL = 'https://www.ycombinator.com/jobs';
+
+const USER_AGENT =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // ── Keyword matching ──
 
@@ -104,102 +101,101 @@ interface RawJob {
   postedAt: string;
 }
 
-/**
- * Scrape job listings from a YC jobs page.
- *
- * DOM structure (verified 2026-03-30):
- *   ul.space-y-2 > li  (one per job, newest first)
- *     li contains:
- *       a[href="/companies/SLUG"]            — company link
- *       span.font-bold                       — "Company (BATCH)"
- *       a[href="/companies/SLUG/jobs/ID-*"]  — role title link (class text-linkColor)
- *       span.text-gray-400                   — "(3 days ago)"
- */
-async function scrapeJobsFromPage(page: Page, url: string): Promise<RawJob[]> {
-  await page.goto(url, { waitUntil: 'networkidle', timeout: 30_000 });
-  await page
-    .waitForSelector('ul.space-y-2 > li', { timeout: 15_000 })
-    .catch(() => null);
-
-  const extractJobs = new Function(`
-    const jobs = [];
-    const cards = document.querySelectorAll('ul.space-y-2 > li');
-
-    for (const card of cards) {
-      const roleLink = card.querySelector('a[href*="/companies/"][href*="/jobs/"]');
-      if (!roleLink) continue;
-
-      const roleTitle = roleLink.textContent.trim();
-      const roleHref = roleLink.getAttribute('href') || '';
-      const fullRoleUrl = 'https://www.ycombinator.com' + roleHref;
-
-      const jobIdMatch = roleHref.match(/\\/jobs\\/([^-]+)/);
-      const jobId = jobIdMatch ? jobIdMatch[1] : roleHref;
-
-      const nameSpan = card.querySelector('span.font-bold');
-      const nameText = nameSpan ? nameSpan.textContent.trim() : '';
-      const batchMatch = nameText.match(/\\(([WS]\\d{2})\\)/);
-      const batch = batchMatch ? batchMatch[1] : '';
-      const companyName = nameText.replace(/\\s*\\([WS]\\d{2}\\)/, '').trim();
-
-      const companyLink = card.querySelector('a[href*="/companies/"]:not([href*="/jobs/"])');
-      const companyHref = companyLink ? companyLink.getAttribute('href') : '';
-      const companyUrl = companyHref ? 'https://www.ycombinator.com' + companyHref : '';
-
-      const postedSpan = card.querySelector('span.text-gray-400, [class*="text-gray-400"]');
-      const postedText = postedSpan ? postedSpan.textContent.replace(/[()]/g, '').trim() : '';
-
-      if (roleTitle) {
-        jobs.push({
-          jobId: jobId,
-          companyName: companyName,
-          companyBatch: batch,
-          companyUrl: companyUrl,
-          roleTitle: roleTitle,
-          roleUrl: fullRoleUrl,
-          postedAt: postedText || new Date().toISOString(),
-        });
-      }
-    }
-
-    return jobs;
-  `) as () => RawJob[];
-
-  return page.evaluate(extractJobs);
+/** Shape of each job object embedded in the YC jobs page HTML. */
+interface YCEmbeddedJob {
+  id: number;
+  title: string;
+  url: string;
+  companyName: string;
+  companyBatchName: string | null;
+  companyUrl: string;
+  lastActive: string;
+  prettyRole: string;
+  [key: string]: unknown;
 }
 
-export async function scrapeYCJobs(): Promise<RawJob[]> {
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  });
+/**
+ * Extract the embedded JSON job listings from a YC jobs page.
+ *
+ * The YC /jobs page embeds structured job data as HTML-entity-encoded
+ * JSON in the page source (no JS execution needed).
+ */
+function extractJobsFromHtml(html: string): RawJob[] {
+  // Find the HTML-entity-encoded JSON array: [{&quot;id&quot;:...}]
+  const marker = '[{&quot;id&quot;';
+  const idx = html.indexOf(marker);
+  if (idx === -1) return [];
 
-  const allJobs = new Map<string, RawJob>();
+  // Decode HTML entities
+  const decoded = html
+    .slice(idx)
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/\\u0026/g, '&');
 
-  try {
-    const page = await context.newPage();
-
-    for (const url of YC_JOBS_URLS) {
-      console.log(`Scraping ${url}...`);
-      try {
-        const jobs = await scrapeJobsFromPage(page, url);
-        for (const job of jobs) {
-          if (!allJobs.has(job.jobId)) {
-            allJobs.set(job.jobId, job);
-          }
-        }
-        // 1-2s random delay between pages
-        await page.waitForTimeout(1000 + Math.random() * 1000);
-      } catch (err) {
-        console.error(`Failed to scrape ${url}:`, err);
+  // Find the matching closing bracket
+  let depth = 0;
+  let end = 0;
+  for (let i = 0; i < decoded.length; i++) {
+    if (decoded[i] === '[') depth++;
+    if (decoded[i] === ']') {
+      depth--;
+      if (depth === 0) {
+        end = i + 1;
+        break;
       }
     }
-  } finally {
-    await browser.close();
   }
 
-  return Array.from(allJobs.values());
+  if (end === 0) return [];
+
+  let jobs: YCEmbeddedJob[];
+  try {
+    jobs = JSON.parse(decoded.slice(0, end));
+  } catch {
+    console.error('Failed to parse embedded YC jobs JSON');
+    return [];
+  }
+
+  return jobs.map((j) => ({
+    jobId: String(j.id),
+    companyName: j.companyName || '',
+    companyBatch: j.companyBatchName || '',
+    companyUrl: j.companyUrl
+      ? `https://www.ycombinator.com${j.companyUrl}`
+      : '',
+    roleTitle: j.title || '',
+    roleUrl: j.url
+      ? `https://www.ycombinator.com${j.url}`
+      : '',
+    postedAt: j.lastActive || '',
+  }));
+}
+
+/**
+ * Scrape YC job listings using fetch + HTML parsing.
+ * Extracts structured JSON embedded in the page source.
+ */
+export async function scrapeYCJobs(): Promise<RawJob[]> {
+  console.log(`Fetching ${YC_JOBS_URL}...`);
+
+  const res = await fetch(YC_JOBS_URL, {
+    headers: { 'User-Agent': USER_AGENT },
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!res.ok) {
+    console.error(`YC jobs page returned ${res.status}`);
+    return [];
+  }
+
+  const html = await res.text();
+  const jobs = extractJobsFromHtml(html);
+  console.log(`Extracted ${jobs.length} jobs from embedded JSON`);
+
+  return jobs;
 }
 
 // ── Incremental match + queue ──
@@ -224,15 +220,12 @@ export async function queueNewListings(): Promise<YCJobListing[]> {
   let hitExisting = false;
 
   for (const job of rawJobs) {
-    // Skip duplicates within this scrape (same job across multiple URLs)
     if (seenJobIds.has(job.jobId)) continue;
     seenJobIds.add(job.jobId);
 
-    // Check Supabase for this job_id
     const exists = await jobIdExists(job.jobId);
 
     if (exists) {
-      // We've reached previously processed jobs — stop checking further
       if (!hitExisting) {
         console.log(
           `Hit existing job_id ${job.jobId} ("${job.roleTitle}") — stopping incremental scan`
@@ -242,7 +235,6 @@ export async function queueNewListings(): Promise<YCJobListing[]> {
       continue;
     }
 
-    // New job — run keyword matching
     newCount++;
     const keyword = matchKeywords(job.roleTitle);
     if (!keyword) continue;
@@ -272,7 +264,6 @@ export async function queueNewListings(): Promise<YCJobListing[]> {
       }))
     );
 
-    // Log all new jobs to dedup_log
     for (const m of matched) {
       await insertDedupLog('yc_jobs', m.job_id);
     }
@@ -295,7 +286,6 @@ if (require.main === module) {
     const rawJobs = await scrapeYCJobs();
     console.log(`\nScraped ${rawJobs.length} total jobs from YC\n`);
 
-    // Show first 10 scraped jobs
     for (const job of rawJobs.slice(0, 10)) {
       console.log(`  [${job.companyBatch || '??'}] ${job.companyName} — ${job.roleTitle}`);
       console.log(`       ${job.roleUrl}`);
@@ -304,7 +294,6 @@ if (require.main === module) {
       console.log(`  ... and ${rawJobs.length - 10} more\n`);
     }
 
-    // Run keyword matching
     console.log('\n--- Keyword Matches ---\n');
     let matchCount = 0;
     for (const job of rawJobs) {
