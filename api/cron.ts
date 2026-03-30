@@ -1,5 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { queueNewListings } from '../src/pipelines/yc-jobs';
+import { sendDigestEmail } from '../src/email/digest';
 import { runHNFundingPipeline } from '../src/pipelines/hn-funding';
 import { runHNSignalsPipeline } from '../src/pipelines/hn-signals';
 
@@ -19,12 +20,19 @@ export default async function handler(
   try {
     switch (pipeline) {
       case 'yc-jobs': {
-        console.log('Running Pipeline 1: YC Jobs scrape + digest');
+        console.log('Running Pipeline 1: YC Jobs scrape');
         const matched = await queueNewListings();
         res.status(200).json({
           pipeline: 'yc-jobs',
           matched: matched.length,
         });
+        break;
+      }
+
+      case 'digest': {
+        console.log('Running Pipeline 1: Digest email');
+        await sendDigestEmail();
+        res.status(200).json({ pipeline: 'digest', sent: true });
         break;
       }
 

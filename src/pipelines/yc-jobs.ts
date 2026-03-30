@@ -4,7 +4,6 @@ import {
   insertJobListings,
   insertDedupLog,
 } from '../db/supabase';
-import { sendDigestEmail } from '../email/digest';
 import type { YCJobListing } from '../types';
 
 const USER_AGENT =
@@ -14,12 +13,14 @@ const YC_JOBS_URL = 'https://www.ycombinator.com/jobs';
 const YC_COMPANIES_API = 'https://yc-oss.github.io/api/companies/all.json';
 
 /**
- * Max company pages to scrape per run. At ~1.5s per page this fits
- * comfortably within Vercel's 60s function timeout.
- * Prioritises newest batches — over multiple daily runs we cover all
- * hiring companies.
+ * Max company pages to scrape per run. At ~1s delay per page, 3 pages
+ * keeps the function well within Vercel's 60s timeout even with the
+ * main /jobs fetch + API fetch overhead.
  */
-const MAX_COMPANY_PAGES_PER_RUN = 30;
+const MAX_PAGES_PER_RUN = 3;
+
+/** Stop scraping once we hit this many consecutive known job IDs. */
+const DEDUP_STOP_THRESHOLD = 5;
 
 // ── Keyword matching ──
 
@@ -135,7 +136,7 @@ function batchSortKey(batch: string): number {
   if (!match) return 0;
   const year = parseInt(match[2]);
   const season = match[1] === 'Winter' ? 0.1 : match[1] === 'Spring' ? 0.3 : match[1] === 'Summer' ? 0.5 : 0.7;
-  return -(year + season); // negative so newest sorts first
+  return -(year + season);
 }
 
 interface YCCompany {
@@ -147,14 +148,15 @@ interface YCCompany {
 }
 
 /**
- * Scrape YC job listings:
+ * Scrape YC job listings from two sources:
  *
- * 1. Main /jobs page — 20 featured listings (embedded JSON, one request)
- * 2. YC OSS API — find companies with isHiring=true, sorted newest batch first
- * 3. Scrape up to MAX_COMPANY_PAGES_PER_RUN company pages for their jobs
- *    (1-2s delay between requests, fits within 60s Vercel timeout)
+ * 1. Main /jobs page — 20 featured listings (1 request)
+ * 2. YC OSS API → top MAX_PAGES_PER_RUN company pages sorted by newest
+ *    batch (1s delay between requests)
  *
- * Over multiple daily runs, all hiring companies get covered.
+ * Fits within Vercel's 60s timeout. Over multiple daily runs, newer
+ * companies get covered first. After the first full baseline, subsequent
+ * runs only process new jobs via incremental dedup.
  */
 export async function scrapeYCJobs(): Promise<RawJob[]> {
   const allJobs = new Map<string, RawJob>();
@@ -175,7 +177,7 @@ export async function scrapeYCJobs(): Promise<RawJob[]> {
     console.error('Failed to fetch main jobs page:', err);
   }
 
-  // Source 2: Company pages for hiring companies
+  // Source 2: Company pages for newest hiring companies
   console.log(`Fetching YC companies API...`);
   try {
     const res = await fetch(YC_COMPANIES_API, { signal: AbortSignal.timeout(15_000) });
@@ -186,9 +188,9 @@ export async function scrapeYCJobs(): Promise<RawJob[]> {
       .filter((c) => c.isHiring)
       .sort((a, b) => batchSortKey(a.batch) - batchSortKey(b.batch));
 
-    console.log(`${hiring.length} hiring companies, scraping top ${MAX_COMPANY_PAGES_PER_RUN}...`);
+    const batch = hiring.slice(0, MAX_PAGES_PER_RUN);
+    console.log(`${hiring.length} hiring companies, scraping ${batch.length} newest...`);
 
-    const batch = hiring.slice(0, MAX_COMPANY_PAGES_PER_RUN);
     for (const company of batch) {
       const url = `https://www.ycombinator.com/companies/${company.slug}`;
       try {
@@ -203,8 +205,8 @@ export async function scrapeYCJobs(): Promise<RawJob[]> {
           if (!allJobs.has(j.jobId)) allJobs.set(j.jobId, j);
         }
 
-        // 1-2s delay
-        await new Promise((r) => setTimeout(r, 1000 + Math.random() * 1000));
+        // 1s delay between requests
+        await new Promise((r) => setTimeout(r, 1000));
       } catch {
         // skip failed page
       }
@@ -220,6 +222,17 @@ export async function scrapeYCJobs(): Promise<RawJob[]> {
 
 // ── Incremental match + queue ──
 
+/**
+ * Scrape YC jobs and incrementally process only new listings.
+ *
+ * For each job:
+ *   1. Check if job_id already exists in Supabase
+ *   2. If we hit DEDUP_STOP_THRESHOLD consecutive known IDs → stop
+ *      (we've caught up to previously seen jobs)
+ *   3. If new → run keyword matching, queue for insert
+ *
+ * On the very first run (empty DB), all jobs are new → full baseline.
+ */
 export async function queueNewListings(): Promise<YCJobListing[]> {
   const rawJobs = await scrapeYCJobs();
   console.log(`Scraped ${rawJobs.length} total jobs`);
@@ -227,22 +240,27 @@ export async function queueNewListings(): Promise<YCJobListing[]> {
   const matched: YCJobListing[] = [];
   const seenJobIds = new Set<string>();
   let newCount = 0;
-  let hitExisting = false;
+  let consecutiveExisting = 0;
 
   for (const job of rawJobs) {
     if (seenJobIds.has(job.jobId)) continue;
     seenJobIds.add(job.jobId);
 
     const exists = await jobIdExists(job.jobId);
+
     if (exists) {
-      if (!hitExisting) {
-        console.log(`Hit existing job_id ${job.jobId} ("${job.roleTitle}") — stopping incremental scan`);
+      consecutiveExisting++;
+      if (consecutiveExisting >= DEDUP_STOP_THRESHOLD) {
+        console.log(`Hit ${DEDUP_STOP_THRESHOLD} consecutive known jobs — caught up, stopping`);
+        break;
       }
-      hitExisting = true;
       continue;
     }
 
+    // New job resets the consecutive counter
+    consecutiveExisting = 0;
     newCount++;
+
     const keyword = matchKeywords(job.roleTitle);
     if (!keyword) continue;
 
@@ -258,19 +276,16 @@ export async function queueNewListings(): Promise<YCJobListing[]> {
     });
   }
 
-  console.log(`${newCount} new jobs found${hitExisting ? ' (incremental)' : ' (first run — full baseline)'}`);
+  const isFirstRun = consecutiveExisting === 0 && newCount === rawJobs.length;
+  console.log(`${newCount} new jobs found${isFirstRun ? ' (first run — full baseline)' : ' (incremental)'}`);
 
   if (matched.length > 0) {
     const now = new Date().toISOString();
     await insertJobListings(matched.map((m) => ({ ...m, first_seen_at: now })));
     for (const m of matched) await insertDedupLog('yc_jobs', m.job_id);
     console.log(`Inserted ${matched.length} new matched listings`);
-
-    // Send digest email immediately
-    console.log('Sending digest email...');
-    await sendDigestEmail();
   } else {
-    console.log('No new matched listings — skipping digest email');
+    console.log('No new matched listings');
   }
 
   return matched;

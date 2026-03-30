@@ -7,8 +7,9 @@
     }
   },
   "crons": [
-    { "path": "/api/cron?pipeline=yc-jobs",    "schedule": "0 23 * * *" },
-    { "path": "/api/cron?pipeline=hn-funding", "schedule": "0 23 * * *" },
-    { "path": "/api/cron?pipeline=hn-signals", "schedule": "0 23 * * *" }
+    { "path": "/api/cron?pipeline=yc-jobs",    "schedule": "0 22 * * *"  },
+    { "path": "/api/cron?pipeline=digest",     "schedule": "5 22 * * *"  },
+    { "path": "/api/cron?pipeline=hn-funding", "schedule": "0 22 * * *"  },
+    { "path": "/api/cron?pipeline=hn-signals", "schedule": "0 22 * * *"  }
   ]
 }
