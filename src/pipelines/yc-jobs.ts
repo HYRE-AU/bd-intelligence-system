@@ -4,14 +4,22 @@ import {
   insertJobListings,
   insertDedupLog,
 } from '../db/supabase';
+import { sendDigestEmail } from '../email/digest';
 import type { YCJobListing } from '../types';
-
-// ── URLs to scrape ──
-
-const YC_JOBS_URL = 'https://www.ycombinator.com/jobs';
 
 const USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+const YC_JOBS_URL = 'https://www.ycombinator.com/jobs';
+const YC_COMPANIES_API = 'https://yc-oss.github.io/api/companies/all.json';
+
+/**
+ * Max company pages to scrape per run. At ~1.5s per page this fits
+ * comfortably within Vercel's 60s function timeout.
+ * Prioritises newest batches — over multiple daily runs we cover all
+ * hiring companies.
+ */
+const MAX_COMPANY_PAGES_PER_RUN = 30;
 
 // ── Keyword matching ──
 
@@ -19,39 +27,25 @@ function normalise(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
 }
 
-/**
- * Exact substring match first, then Levenshtein fallback (distance <= 2)
- * on multi-word keyword phrases only (short keywords like "AE", "SDR"
- * require exact word-boundary match to avoid false positives).
- */
 export function matchKeywords(title: string): string | null {
   const norm = normalise(title);
 
-  // Pass 1: exact substring
   for (const [group, keywords] of Object.entries(SALES_KEYWORDS)) {
     for (const kw of keywords) {
       const kwNorm = normalise(kw);
       if (kwNorm.length <= 4) {
-        const wordPattern = new RegExp(`\\b${kwNorm}\\b`);
-        if (wordPattern.test(norm)) {
-          return `${group}:${kw}`;
-        }
+        if (new RegExp(`\\b${kwNorm}\\b`).test(norm)) return `${group}:${kw}`;
       } else {
-        if (norm.includes(kwNorm)) {
-          return `${group}:${kw}`;
-        }
+        if (norm.includes(kwNorm)) return `${group}:${kw}`;
       }
     }
   }
 
-  // Pass 2: Levenshtein fuzzy match — only for keywords >= 12 chars
   for (const [group, keywords] of Object.entries(SALES_KEYWORDS)) {
     for (const kw of keywords) {
       const kwNorm = normalise(kw);
       if (kwNorm.length < 12) continue;
-      if (fuzzyMatch(norm, kwNorm, 2)) {
-        return `${group}:${kw}`;
-      }
+      if (fuzzyMatch(norm, kwNorm, 2)) return `${group}:${kw}`;
     }
   }
 
@@ -62,30 +56,21 @@ function fuzzyMatch(text: string, keyword: string, maxDist: number): boolean {
   const kLen = keyword.length;
   if (kLen === 0) return false;
   for (let i = 0; i <= text.length - kLen; i++) {
-    const window = text.slice(i, i + kLen);
-    if (levenshtein(window, keyword) <= maxDist) {
-      return true;
-    }
+    if (levenshtein(text.slice(i, i + kLen), keyword) <= maxDist) return true;
   }
   return false;
 }
 
 function levenshtein(a: string, b: string): number {
-  const m = a.length;
-  const n = b.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () =>
-    Array(n + 1).fill(0)
-  );
+  const m = a.length, n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
   for (let i = 0; i <= m; i++) dp[i][0] = i;
   for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      dp[i][j] =
-        a[i - 1] === b[j - 1]
-          ? dp[i - 1][j - 1]
-          : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
-    }
-  }
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = a[i-1] === b[j-1]
+        ? dp[i-1][j-1]
+        : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
   return dp[m][n];
 }
 
@@ -101,7 +86,6 @@ interface RawJob {
   postedAt: string;
 }
 
-/** Shape of each job object embedded in the YC jobs page HTML. */
 interface YCEmbeddedJob {
   id: number;
   title: string;
@@ -110,106 +94,132 @@ interface YCEmbeddedJob {
   companyBatchName: string | null;
   companyUrl: string;
   lastActive: string;
-  prettyRole: string;
   [key: string]: unknown;
 }
 
-/**
- * Extract the embedded JSON job listings from a YC jobs page.
- *
- * The YC /jobs page embeds structured job data as HTML-entity-encoded
- * JSON in the page source (no JS execution needed).
- */
 function extractJobsFromHtml(html: string): RawJob[] {
-  // Find the HTML-entity-encoded JSON array: [{&quot;id&quot;:...}]
   const marker = '[{&quot;id&quot;';
   const idx = html.indexOf(marker);
   if (idx === -1) return [];
 
-  // Decode HTML entities
-  const decoded = html
-    .slice(idx)
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
+  const decoded = html.slice(idx)
+    .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
     .replace(/\\u0026/g, '&');
 
-  // Find the matching closing bracket
-  let depth = 0;
-  let end = 0;
+  let depth = 0, end = 0;
   for (let i = 0; i < decoded.length; i++) {
     if (decoded[i] === '[') depth++;
-    if (decoded[i] === ']') {
-      depth--;
-      if (depth === 0) {
-        end = i + 1;
-        break;
-      }
-    }
+    if (decoded[i] === ']') { depth--; if (depth === 0) { end = i + 1; break; } }
   }
-
   if (end === 0) return [];
 
   let jobs: YCEmbeddedJob[];
-  try {
-    jobs = JSON.parse(decoded.slice(0, end));
-  } catch {
-    console.error('Failed to parse embedded YC jobs JSON');
-    return [];
-  }
+  try { jobs = JSON.parse(decoded.slice(0, end)); }
+  catch { return []; }
 
   return jobs.map((j) => ({
     jobId: String(j.id),
     companyName: j.companyName || '',
     companyBatch: j.companyBatchName || '',
-    companyUrl: j.companyUrl
-      ? `https://www.ycombinator.com${j.companyUrl}`
-      : '',
+    companyUrl: j.companyUrl ? `https://www.ycombinator.com${j.companyUrl}` : '',
     roleTitle: j.title || '',
-    roleUrl: j.url
-      ? `https://www.ycombinator.com${j.url}`
-      : '',
+    roleUrl: j.url ? `https://www.ycombinator.com${j.url}` : '',
     postedAt: j.lastActive || '',
   }));
 }
 
+/** Sort batch strings so newest batches come first. */
+function batchSortKey(batch: string): number {
+  const match = batch.match(/(Winter|Summer|Fall|Spring)\s+(\d{4})/);
+  if (!match) return 0;
+  const year = parseInt(match[2]);
+  const season = match[1] === 'Winter' ? 0.1 : match[1] === 'Spring' ? 0.3 : match[1] === 'Summer' ? 0.5 : 0.7;
+  return -(year + season); // negative so newest sorts first
+}
+
+interface YCCompany {
+  name: string;
+  slug: string;
+  batch: string;
+  isHiring: boolean;
+  [key: string]: unknown;
+}
+
 /**
- * Scrape YC job listings using fetch + HTML parsing.
- * Extracts structured JSON embedded in the page source.
+ * Scrape YC job listings:
+ *
+ * 1. Main /jobs page — 20 featured listings (embedded JSON, one request)
+ * 2. YC OSS API — find companies with isHiring=true, sorted newest batch first
+ * 3. Scrape up to MAX_COMPANY_PAGES_PER_RUN company pages for their jobs
+ *    (1-2s delay between requests, fits within 60s Vercel timeout)
+ *
+ * Over multiple daily runs, all hiring companies get covered.
  */
 export async function scrapeYCJobs(): Promise<RawJob[]> {
+  const allJobs = new Map<string, RawJob>();
+
+  // Source 1: Main /jobs page
   console.log(`Fetching ${YC_JOBS_URL}...`);
-
-  const res = await fetch(YC_JOBS_URL, {
-    headers: { 'User-Agent': USER_AGENT },
-    signal: AbortSignal.timeout(30_000),
-  });
-
-  if (!res.ok) {
-    console.error(`YC jobs page returned ${res.status}`);
-    return [];
+  try {
+    const res = await fetch(YC_JOBS_URL, {
+      headers: { 'User-Agent': USER_AGENT },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (res.ok) {
+      const jobs = extractJobsFromHtml(await res.text());
+      for (const j of jobs) allJobs.set(j.jobId, j);
+      console.log(`Main page: ${jobs.length} jobs`);
+    }
+  } catch (err) {
+    console.error('Failed to fetch main jobs page:', err);
   }
 
-  const html = await res.text();
-  const jobs = extractJobsFromHtml(html);
-  console.log(`Extracted ${jobs.length} jobs from embedded JSON`);
+  // Source 2: Company pages for hiring companies
+  console.log(`Fetching YC companies API...`);
+  try {
+    const res = await fetch(YC_COMPANIES_API, { signal: AbortSignal.timeout(15_000) });
+    if (!res.ok) throw new Error(`API returned ${res.status}`);
 
-  return jobs;
+    const companies = (await res.json()) as YCCompany[];
+    const hiring = companies
+      .filter((c) => c.isHiring)
+      .sort((a, b) => batchSortKey(a.batch) - batchSortKey(b.batch));
+
+    console.log(`${hiring.length} hiring companies, scraping top ${MAX_COMPANY_PAGES_PER_RUN}...`);
+
+    const batch = hiring.slice(0, MAX_COMPANY_PAGES_PER_RUN);
+    for (const company of batch) {
+      const url = `https://www.ycombinator.com/companies/${company.slug}`;
+      try {
+        const pageRes = await fetch(url, {
+          headers: { 'User-Agent': USER_AGENT },
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!pageRes.ok) continue;
+
+        const jobs = extractJobsFromHtml(await pageRes.text());
+        for (const j of jobs) {
+          if (!allJobs.has(j.jobId)) allJobs.set(j.jobId, j);
+        }
+
+        // 1-2s delay
+        await new Promise((r) => setTimeout(r, 1000 + Math.random() * 1000));
+      } catch {
+        // skip failed page
+      }
+    }
+
+    console.log(`Total after company pages: ${allJobs.size} unique jobs`);
+  } catch (err) {
+    console.error('Failed to process YC companies:', err);
+  }
+
+  return Array.from(allJobs.values());
 }
 
 // ── Incremental match + queue ──
 
-/**
- * Scrape YC jobs and incrementally process only new listings.
- *
- * For each scraped job (newest first):
- *   1. Check if job_id already exists in Supabase
- *   2. If it exists → we've reached previously processed jobs, stop
- *   3. If new → run keyword matching, queue for insert
- *
- * On the very first run (empty DB), all jobs are new → full baseline.
- */
 export async function queueNewListings(): Promise<YCJobListing[]> {
   const rawJobs = await scrapeYCJobs();
   console.log(`Scraped ${rawJobs.length} total jobs`);
@@ -224,12 +234,9 @@ export async function queueNewListings(): Promise<YCJobListing[]> {
     seenJobIds.add(job.jobId);
 
     const exists = await jobIdExists(job.jobId);
-
     if (exists) {
       if (!hitExisting) {
-        console.log(
-          `Hit existing job_id ${job.jobId} ("${job.roleTitle}") — stopping incremental scan`
-        );
+        console.log(`Hit existing job_id ${job.jobId} ("${job.roleTitle}") — stopping incremental scan`);
       }
       hitExisting = true;
       continue;
@@ -251,33 +258,25 @@ export async function queueNewListings(): Promise<YCJobListing[]> {
     });
   }
 
-  console.log(
-    `${newCount} new jobs found${hitExisting ? ' (incremental)' : ' (first run — full baseline)'}`
-  );
+  console.log(`${newCount} new jobs found${hitExisting ? ' (incremental)' : ' (first run — full baseline)'}`);
 
   if (matched.length > 0) {
     const now = new Date().toISOString();
-    await insertJobListings(
-      matched.map((m) => ({
-        ...m,
-        first_seen_at: now,
-      }))
-    );
-
-    for (const m of matched) {
-      await insertDedupLog('yc_jobs', m.job_id);
-    }
-
+    await insertJobListings(matched.map((m) => ({ ...m, first_seen_at: now })));
+    for (const m of matched) await insertDedupLog('yc_jobs', m.job_id);
     console.log(`Inserted ${matched.length} new matched listings`);
+
+    // Send digest email immediately
+    console.log('Sending digest email...');
+    await sendDigestEmail();
   } else {
-    console.log('No new matched listings');
+    console.log('No new matched listings — skipping digest email');
   }
 
   return matched;
 }
 
 // ── Local test mode ──
-// Run with: npx ts-node src/pipelines/yc-jobs.ts
 
 if (require.main === module) {
   (async () => {
@@ -290,9 +289,7 @@ if (require.main === module) {
       console.log(`  [${job.companyBatch || '??'}] ${job.companyName} — ${job.roleTitle}`);
       console.log(`       ${job.roleUrl}`);
     }
-    if (rawJobs.length > 10) {
-      console.log(`  ... and ${rawJobs.length - 10} more\n`);
-    }
+    if (rawJobs.length > 10) console.log(`  ... and ${rawJobs.length - 10} more\n`);
 
     console.log('\n--- Keyword Matches ---\n');
     let matchCount = 0;
@@ -302,15 +299,10 @@ if (require.main === module) {
         matchCount++;
         console.log(`  ✓ ${job.companyName} (${job.companyBatch || '??'}) — ${job.roleTitle}`);
         console.log(`    Matched: ${keyword}`);
-        console.log(`    URL: ${job.roleUrl}`);
-        console.log();
+        console.log(`    URL: ${job.roleUrl}\n`);
       }
     }
-
     console.log(`Total: ${matchCount} matches out of ${rawJobs.length} jobs\n`);
     process.exit(0);
-  })().catch((err) => {
-    console.error('Fatal error:', err);
-    process.exit(1);
-  });
+  })().catch((err) => { console.error('Fatal error:', err); process.exit(1); });
 }
