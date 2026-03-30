@@ -126,8 +126,25 @@ function extractJobsFromHtml(html: string): RawJob[] {
     companyUrl: j.companyUrl ? `https://www.ycombinator.com${j.companyUrl}` : '',
     roleTitle: j.title || '',
     roleUrl: j.url ? `https://www.ycombinator.com${j.url}` : '',
-    postedAt: j.lastActive || '',
+    postedAt: relativeTimeToISO(j.lastActive || ''),
   }));
+}
+
+/**
+ * Convert YC's relative time strings ("5 days", "about 3 hours",
+ * "over 1 year") to an ISO timestamp by subtracting from now.
+ */
+function relativeTimeToISO(text: string): string {
+  const now = Date.now();
+  const num = parseInt(text.replace(/[^0-9]/g, '')) || 1;
+
+  if (text.includes('hour')) return new Date(now - num * 60 * 60 * 1000).toISOString();
+  if (text.includes('day')) return new Date(now - num * 24 * 60 * 60 * 1000).toISOString();
+  if (text.includes('month')) return new Date(now - num * 30 * 24 * 60 * 60 * 1000).toISOString();
+  if (text.includes('year')) return new Date(now - num * 365 * 24 * 60 * 60 * 1000).toISOString();
+
+  // Fallback: use current time
+  return new Date(now).toISOString();
 }
 
 /** Sort batch strings so newest batches come first. */
