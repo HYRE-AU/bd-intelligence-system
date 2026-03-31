@@ -53,12 +53,23 @@ export async function getJobListingCount(): Promise<number> {
   return count ?? 0;
 }
 
-export async function getUnsentJobListings() {
-  const { data, error } = await getSupabase()
+export async function getUnsentJobListingsCount(): Promise<number> {
+  const { count, error } = await getSupabase()
+    .from('yc_job_listings')
+    .select('*', { count: 'exact', head: true })
+    .is('alerted_at', null);
+  if (error) throw error;
+  return count ?? 0;
+}
+
+export async function getUnsentJobListings(limit?: number) {
+  let query = getSupabase()
     .from('yc_job_listings')
     .select('*')
     .is('alerted_at', null)
-    .order('posted_at', { ascending: false });
+    .order('first_seen_at', { ascending: false });
+  if (limit) query = query.limit(limit);
+  const { data, error } = await query;
   if (error) throw error;
   return data ?? [];
 }
@@ -69,6 +80,14 @@ export async function markJobListingsAlerted(ids: string[]): Promise<void> {
     .from('yc_job_listings')
     .update({ alerted_at: new Date().toISOString() })
     .in('id', ids);
+  if (error) throw error;
+}
+
+export async function markAllUnsentAsAlerted(): Promise<void> {
+  const { error } = await getSupabase()
+    .from('yc_job_listings')
+    .update({ alerted_at: new Date().toISOString() })
+    .is('alerted_at', null);
   if (error) throw error;
 }
 

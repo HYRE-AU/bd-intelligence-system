@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "test:p1": "ts-node scripts/test-pipeline-1.ts",
     "test:p2": "ts-node scripts/test-pipeline-2.ts",
-    "test:p3": "ts-node scripts/test-pipeline-3.ts"
+    "test:p3": "ts-node scripts/test-pipeline-3.ts",
+    "seed": "ts-node scripts/seed-database.ts"
   },
   "repository": {
     "type": "git",

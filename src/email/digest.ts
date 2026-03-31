@@ -1,15 +1,25 @@
 import { Resend } from 'resend';
-import { getUnsentJobListings, markJobListingsAlerted } from '../db/supabase';
+import {
+  getUnsentJobListings,
+  getUnsentJobListingsCount,
+  markAllUnsentAsAlerted,
+} from '../db/supabase';
 
-export async function sendDigestEmail(): Promise<void> {
-  const listings = await getUnsentJobListings();
+const MAX_EMAIL_ROLES = 50;
 
-  if (listings.length === 0) {
+export async function sendDigestEmail(subjectOverride?: string): Promise<void> {
+  const totalCount = await getUnsentJobListingsCount();
+
+  if (totalCount === 0) {
     console.log('No unsent listings — skipping digest email');
     return;
   }
 
-  console.log(`Sending digest with ${listings.length} new roles`);
+  // Fetch only the 50 most recent by first_seen_at
+  const listings = await getUnsentJobListings(MAX_EMAIL_ROLES);
+  const isTruncated = totalCount > MAX_EMAIL_ROLES;
+
+  console.log(`Sending digest: ${listings.length} roles in email (${totalCount} total unsent)`);
 
   const now = new Date();
   const dayDate = now.toLocaleDateString('en-AU', {
@@ -18,9 +28,9 @@ export async function sendDigestEmail(): Promise<void> {
     month: 'long',
   });
 
-  const subject = `🚀 ${listings.length} new sales roles on YC — ${dayDate}`;
+  const subject =
+    subjectOverride || `🚀 ${totalCount} new sales roles on YC — ${dayDate}`;
 
-  // Plain text body, one block per role, sorted by posted_at desc (already sorted by query)
   const body = listings
     .map((l) => {
       const postedAgo = formatTimeAgo(l.posted_at);
@@ -38,7 +48,11 @@ export async function sendDigestEmail(): Promise<void> {
     })
     .join('\n\n');
 
-  const fullBody = `${body}\n\n────────────────────────────────────\n${listings.length} total new roles found.\n`;
+  const footer = isTruncated
+    ? `Showing ${MAX_EMAIL_ROLES} most recent of ${totalCount} total matches. Future daily digests will show only new roles added each day.`
+    : `${totalCount} total new roles found.`;
+
+  const fullBody = `${body}\n\n────────────────────────────────────\n${footer}\n`;
 
   const fromEmail = process.env.RESEND_FROM_EMAIL;
   const toEmail = process.env.RESEND_TO_EMAIL;
@@ -59,10 +73,9 @@ export async function sendDigestEmail(): Promise<void> {
 
   console.log(`Digest email sent: "${subject}"`);
 
-  // Mark all sent listings as alerted
-  const ids = listings.map((l) => l.id);
-  await markJobListingsAlerted(ids);
-  console.log(`Marked ${ids.length} listings as alerted`);
+  // Mark ALL unsent listings as alerted (not just the 50 displayed)
+  await markAllUnsentAsAlerted();
+  console.log(`Marked ${totalCount} listings as alerted`);
 }
 
 function formatTimeAgo(dateStr: string): string {
